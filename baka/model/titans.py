@@ -38,7 +38,8 @@ class DynamicMemoryModule(nn.Module):
     def __init__(self, d_model, d_memory):
         super().__init__()
         self.mlp = MemoryMLP(d_model, d_memory)
-        self.W_base = nn.Parameter(torch.zeros(d_model, d_model))
+        self.W_base = nn.Parameter(torch.empty(d_model, d_model))
+        nn.init.orthogonal_(self.W_base, gain=0.01)
         self.W_current = None  # plain Python attribute, not a buffer
 
     def reset_state(self, batch_size):
