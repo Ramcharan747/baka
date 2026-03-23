@@ -16,11 +16,14 @@ except ImportError:
     from baka.model.baka import BAKA
     from baka.data.pipeline import get_dataloader
 
-def get_lr(step, warmup=500, total_steps=30000):
-    if step < warmup:
-        return 3e-4 * step / max(1, warmup)
-    progress = (step - warmup) / (total_steps - warmup)
-    return max(1e-4, 3e-4 * (1 - progress * 0.8))
+def get_lr(step, total_steps, warmup_steps=2000, start_lr=3e-4, end_lr=3e-5):
+    if step < warmup_steps:
+        return start_lr * step / max(1, warmup_steps)
+    if step >= total_steps:
+        return end_lr
+    decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return end_lr + coeff * (start_lr - end_lr)
 
 def save_checkpoint(model, optimizer, step, tokens_seen, repo_id, token):
     if not token: return
@@ -52,7 +55,18 @@ def load_checkpoint(model, optimizer, repo_id, token):
 
 def pretrain():
     hf_token = os.environ.get('HF_TOKEN')
+   # Explicitly override defaults to build the 18.5M parameter version
     config = BAKAConfig()
+    config.d_model = 512
+    config.n_layers = 4
+    config.n_heads = 8
+    config.d_head = 64
+    config.d_ffn = 2048
+    config.d_memory = 128
+    # Keep these standard
+    config.cms_levels = 4
+    config.titans_chunk_size = 64
+    config.context_length = 8192
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     model = BAKA(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -61,8 +75,11 @@ def pretrain():
     
     batch_size = 2
     seq_len = config.context_length
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'cache')
-    dataloader = get_dataloader(data_dir, batch_size, seq_len+1) if os.path.exists(data_dir) else []
+    
+    # --- The Fixed Streaming Dataloader Section ---
+    print("Connecting to HuggingFace data stream...")
+    dataloader = get_dataloader(batch_size, seq_len + 1)
+    # ----------------------------------------------
     
     effective_batch_tokens = 1_000_000
     tokens_per_iter = batch_size * seq_len
@@ -75,11 +92,12 @@ def pretrain():
     
     for i, batch in enumerate(dataloader):
         for block in model.blocks:
-            block.titans.reset_state(batch.shape[0])
+            if hasattr(block, 'titans'):
+                block.titans.reset_state(batch.shape[0])
             
         batch = batch.to(device)
         x, y = batch[:, :-1], batch[:, 1:]
-        lr = get_lr(step)
+        lr = get_lr(step, total_steps)
         for param_group in optimizer.param_groups: param_group['lr'] = lr
             
         with torch.autocast(device_type=device.type if hasattr(device, 'type') else 'cuda', dtype=torch.bfloat16):
@@ -109,4 +127,5 @@ def pretrain():
                 save_checkpoint(model, optimizer, step, tokens_seen, ckpt_repo, hf_token)
 
 if __name__ == '__main__':
-    print("PASS")
+    # Fixed execution bug: Now it actually starts the training loop!
+    pretrain()

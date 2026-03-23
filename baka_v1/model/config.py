@@ -14,7 +14,7 @@ class BAKAConfig:
     cms_lr: List[float] = dataclasses.field(default_factory=lambda: [1e-3, 1e-4, 1e-5, 1e-6])
     titans_chunk_size: int = 64
     context_length: int = 8192
-    vocab_size: int = 32000  # must use Llama tokenizer
+    vocab_size: int = 151936
 
     def estimated_params(self):
         vocab_params = self.vocab_size * self.d_model

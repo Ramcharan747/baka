@@ -34,8 +34,13 @@ def download_and_tokenize(dataset_name, subset, out_file, tokenizer, max_samples
                 continue
             
             # Tokenize
-            tokens = tokenizer(text, truncation=False, add_special_tokens=True)['input_ids']
-            arr = np.clip(tokens, 0, 31999).astype(np.uint16)
+            tokens = tokenizer(
+                text,
+                truncation=True,
+                max_length=2048,
+                add_special_tokens=True
+            )['input_ids']
+            arr = np.array(tokens, dtype=np.uint16)
             f.write(arr.tobytes())
             
             count += 1
@@ -52,13 +57,8 @@ if __name__ == '__main__':
     
     os.makedirs('baka/data/cache', exist_ok=True)
     
-    # Try specified Qwen3, fallback to Qwen2.5
-    try:
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-        print("Loaded Qwen3 tokenizer.")
-    except Exception:
-        print("Fallback: Qwen/Qwen3-0.6B not available, using Qwen2.5-0.5B")
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    tokenizer = AutoTokenizer.from_pretrained("huggyllama/llama-7b")
+    print("Loaded Llama tokenizer.")
         
     # User requirements
     download_and_tokenize("HuggingFaceFW/fineweb-edu", "sample-10BT", "baka/data/cache/fineweb.bin", tokenizer, max_samples)
