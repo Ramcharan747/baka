@@ -16,24 +16,31 @@ def dgd_update(W, k, v_hat, lr, chunk_size):
     W_f32 = W.to(torch.float32)
     k_f32 = k.to(torch.float32)
     v_hat_f32 = v_hat.to(torch.float32)
-    
+
     if k_f32.dim() == 3:
-        for t in range(chunk_size):
-            k_t = k_f32[:, t, :]
-            v_t = v_hat_f32[:, t, :]
-            
-            lr_prime = lr / (1.0 + lr * (k_t * k_t).sum(-1, keepdim=True))
-            W_k = (W_f32 @ k_t.unsqueeze(-1)).squeeze(-1)
-            residual = W_k - v_t
-            
-            term1 = W_k.unsqueeze(-1) * k_t.unsqueeze(-2)
-            term2 = residual.unsqueeze(-1) * k_t.unsqueeze(-2)
-            W_f32 = W_f32 - lr_prime.unsqueeze(-1) * (term1 + term2)
+        # Vectorized: process all chunk tokens simultaneously
+        # k_f32:     [batch, chunk, d_in]
+        # v_hat_f32: [batch, chunk, d_out]
+        # W_f32:     [batch, d_out, d_in]
+
+        lr_prime = lr / (1.0 + lr * (k_f32 * k_f32).sum(-1, keepdim=True))
+        # [batch, chunk, 1]
+
+        W_k = torch.bmm(k_f32, W_f32.transpose(1, 2))
+        # [batch, chunk, d_out]
+
+        residual = W_k - v_hat_f32
+        # [batch, chunk, d_out]
+
+        # Outer products summed over chunk dimension
+        decay = torch.einsum('bci,bcj->bij', lr_prime * W_k, k_f32)
+        grad  = torch.einsum('bci,bcj->bij', lr_prime * residual, k_f32)
+        W_f32 = W_f32 - decay - grad
     else:
         lr_prime = lr / (1.0 + lr * (k_f32 * k_f32).sum(-1, keepdim=True))
         W_k = (W_f32 @ k_f32.unsqueeze(-1)).squeeze(-1)
         residual = W_k - v_hat_f32
-        
+
         term1 = W_k.unsqueeze(-1) * k_f32.unsqueeze(-2)
         term2 = residual.unsqueeze(-1) * k_f32.unsqueeze(-2)
         W_f32 = W_f32 - lr_prime.unsqueeze(-1) * (term1 + term2)
