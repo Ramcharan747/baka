@@ -13,7 +13,6 @@ class BAKADataset(Dataset):
             if f.endswith('.bin')
         ])
 
-        # Memory map all files to avoid loading gigabytes into RAM
         self.mmaps = []
         self.file_lengths = []
         self.total_chunks = 0
@@ -48,57 +47,56 @@ class BAKADataset(Dataset):
         return torch.from_numpy(chunk)
 
 
-class NoRepeatSampler(Sampler):
-    """Sampler that tracks which indices have been used across sessions.
-    Saves state to a JSON file so training can resume without repeating data."""
+class SequentialSampler:
+    """Walks through data in order. Tracks position across sessions via JSON file.
+    Zero randomness, zero repeats. Just a counter."""
 
     def __init__(self, total_size, state_file):
         self.total_size = total_size
         self.state_file = state_file
-        self.used_indices = set()
+        self.start_offset = 0
 
-        # Load previously used indices
         if os.path.exists(state_file):
             with open(state_file, 'r') as f:
                 state = json.load(f)
-                self.used_indices = set(state.get('used_indices', []))
-                print(f"Loaded {len(self.used_indices):,} used indices from {state_file}")
+                self.start_offset = state.get('next_index', 0)
 
-        remaining = total_size - len(self.used_indices)
-        print(f"Data tracker: {len(self.used_indices):,} used / {total_size:,} total / {remaining:,} remaining")
-
+        remaining = total_size - self.start_offset
         if remaining <= 0:
-            print("WARNING: All data has been seen! Resetting tracker.")
-            self.used_indices = set()
+            print("WARNING: All data consumed! Wrapping to start.")
+            self.start_offset = 0
+            remaining = total_size
+
+        print(f"Data position: {self.start_offset:,} / {total_size:,} "
+              f"({self.start_offset/total_size*100:.1f}% used, {remaining:,} remaining)")
+
+        self.current = self.start_offset
 
     def __iter__(self):
-        # Get unused indices, shuffle them
-        all_indices = set(range(self.total_size))
-        remaining = list(all_indices - self.used_indices)
-        np.random.shuffle(remaining)
-
-        for idx in remaining:
-            self.used_indices.add(idx)
-            yield idx
+        self.current = self.start_offset
+        while self.current < self.total_size:
+            yield self.current
+            self.current += 1
 
     def __len__(self):
-        return self.total_size - len(self.used_indices)
+        return self.total_size - self.start_offset
 
     def save_state(self):
-        """Call this after training to save which indices were consumed."""
+        """Save current position. Call after training."""
         with open(self.state_file, 'w') as f:
             json.dump({
-                'used_indices': list(self.used_indices),
+                'next_index': self.current,
                 'total_size': self.total_size
             }, f)
-        print(f"Saved {len(self.used_indices):,} used indices to {self.state_file}")
+        pct = self.current / self.total_size * 100
+        print(f"Saved position {self.current:,} / {self.total_size:,} ({pct:.1f}%) to {self.state_file}")
 
 
 def get_dataloader(data_dir, batch_size, seq_len=8192, num_workers=4, prefetch_factor=2):
     dataset = BAKADataset(data_dir, seq_len)
 
     state_file = os.path.join(data_dir, 'sampler_state.json')
-    sampler = NoRepeatSampler(len(dataset), state_file)
+    sampler = SequentialSampler(len(dataset), state_file)
 
     loader = DataLoader(
         dataset,
@@ -109,8 +107,7 @@ def get_dataloader(data_dir, batch_size, seq_len=8192, num_workers=4, prefetch_f
         pin_memory=True,
         drop_last=True
     )
-    # Attach sampler for easy access to save state
-    loader.no_repeat_sampler = sampler
+    loader.sequential_sampler = sampler
     return loader
 
 
@@ -127,8 +124,7 @@ if __name__ == '__main__':
         for batch in loader:
             assert batch.shape == (2, 8192), f"Batch shape expected (2, 8192) got {batch.shape}"
             break
-        # Save state after training
-        loader.no_repeat_sampler.save_state()
+        loader.sequential_sampler.save_state()
         print("PASS")
     finally:
         os.remove(dummy_path)
