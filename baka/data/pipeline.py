@@ -18,6 +18,9 @@ class BAKADataset(Dataset):
         self.total_chunks = 0
 
         for f in self.data_files:
+            fsize = os.path.getsize(f)
+            if fsize == 0:
+                continue
             m = np.memmap(f, dtype=np.uint16, mode='r')
             num_tokens = len(m)
             num_chunks = num_tokens // seq_len
@@ -48,8 +51,7 @@ class BAKADataset(Dataset):
 
 
 class SequentialSampler:
-    """Walks through data in order. Tracks position across sessions via JSON file.
-    Zero randomness, zero repeats. Just a counter."""
+    """Walks through data in order. Tracks position across sessions via JSON file."""
 
     def __init__(self, total_size, state_file):
         self.total_size = total_size
@@ -82,14 +84,13 @@ class SequentialSampler:
         return self.total_size - self.start_offset
 
     def save_state(self):
-        """Save current position. Call after training."""
         with open(self.state_file, 'w') as f:
             json.dump({
                 'next_index': self.current,
                 'total_size': self.total_size
             }, f)
         pct = self.current / self.total_size * 100
-        print(f"Saved position {self.current:,} / {self.total_size:,} ({pct:.1f}%) to {self.state_file}")
+        print(f"Saved position {self.current:,} / {self.total_size:,} ({pct:.1f}%)")
 
 
 def get_dataloader(data_dir, batch_size, seq_len=8192, num_workers=4, prefetch_factor=2):
@@ -109,6 +110,25 @@ def get_dataloader(data_dir, batch_size, seq_len=8192, num_workers=4, prefetch_f
     )
     loader.sequential_sampler = sampler
     return loader
+
+
+def calculate_shards_needed(state_file, steps, batch_size, seq_len, tokens_per_shard=250_000_000):
+    """Calculate which shard numbers are needed for the next N steps."""
+    start_chunk = 0
+    if os.path.exists(state_file):
+        with open(state_file, 'r') as f:
+            start_chunk = json.load(f).get('next_index', 0)
+
+    chunks_per_shard = tokens_per_shard // seq_len
+    chunks_needed = steps * batch_size
+    start_shard = start_chunk // chunks_per_shard
+    end_shard = (start_chunk + chunks_needed) // chunks_per_shard
+
+    shards = list(range(start_shard, end_shard + 1))
+    print(f"Position: chunk {start_chunk:,}")
+    print(f"Need {chunks_needed:,} chunks for {steps} steps")
+    print(f"Shards needed: {shards}")
+    return shards
 
 
 if __name__ == '__main__':
