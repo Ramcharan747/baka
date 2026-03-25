@@ -7,6 +7,7 @@ import sys
 import math
 import time
 import json
+import hashlib
 import argparse
 import numpy as np
 import torch
@@ -30,37 +31,53 @@ def get_lr(step, total_steps, warmup_steps=2000, peak_lr=3e-4, min_lr=3e-5):
 
 
 # ---------------------------------------------------------------------------
+# Guard 3 — Cache checksum (first+last 1MB for speed on large files)
+# ---------------------------------------------------------------------------
+def get_cache_checksum(cache_path):
+    """Fast checksum using first+last 1MB — not full hash (too slow for 20GB)."""
+    h = hashlib.md5()
+    size = os.path.getsize(cache_path)
+    with open(cache_path, "rb") as f:
+        h.update(f.read(min(1024 * 1024, size)))
+        if size > 2 * 1024 * 1024:
+            f.seek(-1024 * 1024, 2)
+            h.update(f.read(1024 * 1024))
+    return h.hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
 # Dataset — Pre-tokenizes JSONL to .bin cache, then memmaps
 # ---------------------------------------------------------------------------
 class PretrainDataset(torch.utils.data.Dataset):
     def __init__(self, jsonl_path, seq_len, start_position=0,
                  tokenizer_name="meta-llama/Llama-3.2-1B"):
         self.seq_len = seq_len
-        cache_path = jsonl_path.replace('.jsonl', '.bin')
+        self.cache_path = jsonl_path.replace('.jsonl', '.bin')
         meta_path = jsonl_path.replace('.jsonl', '_cache_meta.json')
 
         self._tokenizer_name = tokenizer_name
 
         # Validate existing cache was built with the same tokenizer
-        if os.path.exists(cache_path) and os.path.exists(meta_path):
+        if os.path.exists(self.cache_path) and os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
             if meta.get('tokenizer_name') != tokenizer_name:
                 print(f"Cache built with '{meta.get('tokenizer_name')}', "
                       f"but now using '{tokenizer_name}'. Rebuilding cache.")
-                os.remove(cache_path)
+                os.remove(self.cache_path)
                 os.remove(meta_path)
-        elif os.path.exists(cache_path) and not os.path.exists(meta_path):
+        elif os.path.exists(self.cache_path) and not os.path.exists(meta_path):
             print("Cache exists but no metadata found — rebuilding to be safe.")
-            os.remove(cache_path)
+            os.remove(self.cache_path)
 
-        if not os.path.exists(cache_path):
+        if not os.path.exists(self.cache_path):
             print(f"Pre-tokenizing {jsonl_path} ...")
-            self._tokenize_to_bin(jsonl_path, cache_path, meta_path, tokenizer_name)
+            self._tokenize_to_bin(jsonl_path, self.cache_path, meta_path, tokenizer_name)
 
-        self.data = np.memmap(cache_path, dtype=np.uint32, mode='r')
+        self.data = np.memmap(self.cache_path, dtype=np.uint32, mode='r')
         self.total_chunks = len(self.data) // (seq_len + 1)  # +1 for target shift
         self.start_position = start_position
+        self.unique_tokens = self.total_chunks * seq_len  # for repetition tracking
 
         print(f"Dataset: {len(self.data):,} tokens, {self.total_chunks:,} chunks, "
               f"starting at position {start_position}")
@@ -102,22 +119,32 @@ class PretrainDataset(torch.utils.data.Dataset):
         arr.tofile(cache_path)
         print(f"  Saved to {cache_path} ({os.path.getsize(cache_path) / 1e9:.2f} GB)")
 
-        # Write cache metadata for future validation
+        # Write cache metadata + checksum for future validation
+        checksum = get_cache_checksum(cache_path)
         with open(meta_path, 'w') as f:
             json.dump({
                 'tokenizer_name': tokenizer_name,
                 'vocab_size': tokenizer.vocab_size,
                 'n_tokens': total_tokens,
                 'n_documents': count,
+                'checksum': checksum,
                 'created': time.strftime('%Y-%m-%d %H:%M'),
             }, f, indent=2)
-        print(f"  Cache metadata saved to {meta_path}")
+        print(f"  Cache metadata saved to {meta_path} (checksum: {checksum})")
 
     def __len__(self):
         return self.total_chunks - self.start_position
 
+    # Guard 1 — Hard stop on dataset exhaustion
     def __getitem__(self, idx):
         actual_idx = self.start_position + idx
+        if actual_idx >= self.total_chunks:
+            raise IndexError(
+                f"Dataset exhausted at chunk {actual_idx}. "
+                f"Total chunks: {self.total_chunks}. "
+                f"Total tokens available: ~{self.unique_tokens / 1e9:.2f}B. "
+                f"Training complete — do not resubmit unless intentional."
+            )
         start = actual_idx * (self.seq_len + 1)
         end = start + self.seq_len + 1
         chunk = self.data[start:end].astype(np.int64)
@@ -129,7 +156,8 @@ class PretrainDataset(torch.utils.data.Dataset):
 # ---------------------------------------------------------------------------
 # Checkpoint save/load — CMS buffers included via state_dict buffers
 # ---------------------------------------------------------------------------
-def save_checkpoint(model, optimizer, step, tokens_seen, data_position, loss, ckpt_dir):
+def save_checkpoint(model, optimizer, step, tokens_seen, data_position, loss,
+                    ckpt_dir, cache_checksum=None):
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"ckpt_step{step}.pt")
     torch.save({
@@ -137,6 +165,7 @@ def save_checkpoint(model, optimizer, step, tokens_seen, data_position, loss, ck
         'tokens_seen': tokens_seen,
         'data_position': data_position,
         'loss': loss,
+        'cache_checksum': cache_checksum,
         'model': model.state_dict(),        # includes CMS grad_W1_i, grad_W2_i buffers
         'optimizer': optimizer.state_dict(),
     }, path)
@@ -149,7 +178,7 @@ def save_checkpoint(model, optimizer, step, tokens_seen, data_position, loss, ck
         os.remove(os.path.join(ckpt_dir, old))
 
 
-def load_latest_checkpoint(model, optimizer, ckpt_dir):
+def load_latest_checkpoint(model, optimizer, ckpt_dir, seq_len, cache_path=None):
     if not os.path.exists(ckpt_dir):
         return 0, 0, 0
     ckpts = sorted([f for f in os.listdir(ckpt_dir) if f.startswith('ckpt_step')],
@@ -166,7 +195,30 @@ def load_latest_checkpoint(model, optimizer, ckpt_dir):
     step = state['step']
     tokens_seen = state['tokens_seen']
     data_position = state['data_position']
-    print(f"  Resumed: step={step}, tokens={tokens_seen/1e6:.1f}M, "
+
+    # Guard 2 — Verify tokens_seen matches data_position
+    expected_tokens = data_position * seq_len
+    if abs(expected_tokens - tokens_seen) > seq_len * 100:
+        raise RuntimeError(
+            f"Checkpoint inconsistency: data_position implies "
+            f"{expected_tokens/1e9:.2f}B tokens but tokens_seen="
+            f"{tokens_seen/1e9:.2f}B. Cache may have been rebuilt. "
+            f"Delete checkpoint and restart, or fix data_position."
+        )
+
+    # Guard 3 — Verify cache hasn't been rebuilt since checkpoint
+    saved_checksum = state.get('cache_checksum')
+    if saved_checksum and cache_path and os.path.exists(cache_path):
+        current_checksum = get_cache_checksum(cache_path)
+        if current_checksum != saved_checksum:
+            raise RuntimeError(
+                f"Cache file changed since checkpoint was saved. "
+                f"Saved: {saved_checksum}, Current: {current_checksum}. "
+                f"data_position is now invalid. Restore original cache "
+                f"or delete checkpoint."
+            )
+
+    print(f"  Resumed: step={step}, tokens={tokens_seen/1e9:.2f}B, "
           f"data_position={data_position}")
     return step, tokens_seen, data_position
 
@@ -222,18 +274,25 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, lr=3e-4, betas=(0.9, 0.95),
                                   weight_decay=0.1)
 
-    # Resume
+    # Dataset first (needed for cache_path in checkpoint validation)
+    tokens_per_step = args.batch_size * config.context_length  # 64 * 2048 = 131,072
+
+    # Resume — pass cache_path for Guard 3 checksum validation
     start_step, tokens_seen, data_position = 0, 0, 0
+    cache_path = args.data.replace('.jsonl', '.bin')
     if args.resume:
         start_step, tokens_seen, data_position = load_latest_checkpoint(
-            model, optimizer, args.ckpt_dir
+            model, optimizer, args.ckpt_dir, config.context_length,
+            cache_path=cache_path
         )
 
-    # Dataset and DataLoader
-    tokens_per_step = args.batch_size * config.context_length  # 64 * 2048 = 131,072
     dataset = PretrainDataset(args.data, config.context_length,
                               start_position=data_position,
                               tokenizer_name=args.tokenizer)
+
+    # Get cache checksum for checkpoints
+    cache_checksum = get_cache_checksum(dataset.cache_path)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -252,9 +311,11 @@ def main():
 
     print(f"\nTraining: step {step} → {args.total_steps}")
     print(f"Tokens per step: {tokens_per_step:,}")
+    print(f"Unique tokens: {dataset.unique_tokens/1e9:.2f}B")
     print(f"Data remaining: {len(dataset):,} chunks")
     print("=" * 80)
 
+    dataset_exhausted = False
     for batch_x, batch_y in dataloader:
         # Reset Titans state
         for block in model.blocks:
@@ -288,7 +349,7 @@ def main():
         losses.append(loss.item())
         data_position += args.batch_size
 
-        # Logging every 100 steps
+        # Logging every 100 steps — includes repetition ratio
         if step % 100 == 0:
             avg_loss = sum(losses[-100:]) / min(100, len(losses))
             elapsed = time.time() - t_start
@@ -297,20 +358,30 @@ def main():
             tokens_per_sec = sps * tokens_per_step
             eta_hours = (args.total_steps - step) / sps / 3600 if sps > 0 else 0
 
+            # Repetition ratio — should stay ≤ 1.0
+            repeat_ratio = tokens_seen / dataset.unique_tokens if dataset.unique_tokens > 0 else 0
+
             # W_norm of M_mem in block 0
             w_norm = model.blocks[0].titans.M_mem.W_current.norm().item() if \
                      model.blocks[0].titans.M_mem.W_current is not None else 0.0
 
             print(f"Step {step:6d} | Loss: {avg_loss:.4f} | "
-                  f"Tokens: {tokens_seen/1e9:.2f}B | "
+                  f"Tokens: {tokens_seen/1e9:.2f}B / {dataset.unique_tokens/1e9:.2f}B | "
+                  f"Repeat: {repeat_ratio:.2f}x | "
                   f"LR: {lr:.2e} | W_norm: {w_norm:.2f} | "
                   f"TPS: {tokens_per_sec/1e3:.1f}K | "
                   f"ETA: {eta_hours:.1f}h")
 
+            # Guard 1 — warn if approaching exhaustion
+            if repeat_ratio >= 0.95:
+                print(f"  WARNING: Dataset {repeat_ratio:.0%} consumed. "
+                      f"Training will stop when data is exhausted.")
+
         # Checkpoint every 1000 steps
         if step % 1000 == 0:
             save_checkpoint(model, optimizer, step, tokens_seen,
-                            data_position, losses[-1], args.ckpt_dir)
+                            data_position, losses[-1], args.ckpt_dir,
+                            cache_checksum=cache_checksum)
 
         if step >= args.total_steps:
             break
@@ -318,12 +389,14 @@ def main():
     # Final checkpoint
     if step > start_step:
         save_checkpoint(model, optimizer, step, tokens_seen,
-                        data_position, losses[-1] if losses else 0.0, args.ckpt_dir)
+                        data_position, losses[-1] if losses else 0.0,
+                        args.ckpt_dir, cache_checksum=cache_checksum)
 
     elapsed = time.time() - t_start
     print("=" * 80)
+    repeat_ratio = tokens_seen / dataset.unique_tokens if dataset.unique_tokens > 0 else 0
     print(f"Training complete: {step} steps, {tokens_seen/1e9:.2f}B tokens, "
-          f"{elapsed/3600:.1f}h")
+          f"Repeat: {repeat_ratio:.2f}x, {elapsed/3600:.1f}h")
 
 
 if __name__ == '__main__':
