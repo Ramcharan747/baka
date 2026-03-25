@@ -70,7 +70,7 @@ class SelfModifyingTitans(nn.Module):
         self.M_mem = DynamicMemoryModule(self.d_model, config.d_memory)
 
         self.W_q = nn.Linear(self.d_model, self.n_heads * self.d_head, bias=False)
-        self.W_q.weight.requires_grad = False
+        # self.W_q.weight.requires_grad = False  # EXPERIMENT: unfreezing W_q to test if trainable queries help
 
     def reset_state(self, batch_size: int):
         self.M_k.reset_state(batch_size)
