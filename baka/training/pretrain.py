@@ -16,11 +16,13 @@ except ImportError:
     from baka.model.baka import BAKA
     from baka.data.pipeline import get_dataloader
 
-def get_lr(step, warmup=500, total_steps=30000):
-    if step < warmup:
-        return 3e-4 * step / max(1, warmup)
-    progress = (step - warmup) / (total_steps - warmup)
-    return max(1e-4, 3e-4 * (1 - progress * 0.8))
+def get_lr(step, total_steps, warmup_steps=200, peak_lr=3e-4, min_lr=3e-5):
+    """Cosine decay: warmup → peak → cosine decay to min_lr at exactly the last step."""
+    if step < warmup_steps:
+        return peak_lr * (step / max(1, warmup_steps))
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    return min_lr + (peak_lr - min_lr) * cosine
 
 def save_checkpoint(model, optimizer, step, tokens_seen, repo_id, token):
     if not token: return
@@ -79,7 +81,7 @@ def pretrain():
             
         batch = batch.to(device)
         x, y = batch[:, :-1], batch[:, 1:]
-        lr = get_lr(step)
+        lr = get_lr(step, total_steps)
         for param_group in optimizer.param_groups: param_group['lr'] = lr
             
         with torch.autocast(device_type=device.type if hasattr(device, 'type') else 'cuda', dtype=torch.bfloat16):
