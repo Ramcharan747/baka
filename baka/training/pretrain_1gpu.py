@@ -33,13 +33,15 @@ def get_lr(step, total_steps, warmup_steps=2000, peak_lr=3e-4, min_lr=3e-5):
 # Dataset — Pre-tokenizes JSONL to .bin cache, then memmaps
 # ---------------------------------------------------------------------------
 class PretrainDataset(torch.utils.data.Dataset):
-    def __init__(self, jsonl_path, seq_len, start_position=0):
+    def __init__(self, jsonl_path, seq_len, start_position=0,
+                 tokenizer_name="meta-llama/Llama-3.2-1B"):
         self.seq_len = seq_len
         cache_path = jsonl_path.replace('.jsonl', '.bin')
 
+        self._tokenizer_name = tokenizer_name
         if not os.path.exists(cache_path):
             print(f"Pre-tokenizing {jsonl_path} → {cache_path} ...")
-            self._tokenize_to_bin(jsonl_path, cache_path)
+            self._tokenize_to_bin(jsonl_path, cache_path, tokenizer_name)
 
         self.data = np.memmap(cache_path, dtype=np.uint32, mode='r')
         self.total_chunks = len(self.data) // (seq_len + 1)  # +1 for target shift
@@ -48,10 +50,10 @@ class PretrainDataset(torch.utils.data.Dataset):
         print(f"Dataset: {len(self.data):,} tokens, {self.total_chunks:,} chunks, "
               f"starting at position {start_position}")
 
-    def _tokenize_to_bin(self, jsonl_path, cache_path):
+    def _tokenize_to_bin(self, jsonl_path, cache_path, tokenizer_name="meta-llama/Llama-3.2-1B"):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-3.2-1B", trust_remote_code=True
+            tokenizer_name, trust_remote_code=True
         )
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -70,8 +72,17 @@ class PretrainDataset(torch.utils.data.Dataset):
                 if count % 100_000 == 0:
                     print(f"  Tokenized {count:,} documents, {len(all_ids):,} tokens...")
 
-        print(f"  Total: {count:,} documents, {len(all_ids):,} tokens")
+        total_tokens = len(all_ids)
+        print(f"  Total: {count:,} documents, {total_tokens:,} tokens ({total_tokens/1e9:.2f}B)")
+        assert total_tokens > 1_000_000, (
+            f"Only {total_tokens:,} tokens — check JSONL file for corruption"
+        )
+
         arr = np.array(all_ids, dtype=np.uint32)
+        max_id = arr.max()
+        print(f"  Max token ID: {max_id} (vocab_size: {tokenizer.vocab_size})")
+        assert max_id < 65536, f"Token ID {max_id} exceeds vocab_size 65536!"
+
         arr.tofile(cache_path)
         print(f"  Saved to {cache_path} ({os.path.getsize(cache_path) / 1e9:.2f} GB)")
 
@@ -167,6 +178,8 @@ def main():
     parser.add_argument('--resume', action='store_true',
                         help='Resume from latest checkpoint')
     parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--tokenizer', type=str, default='meta-llama/Llama-3.2-1B',
+                        help='HuggingFace tokenizer name (fallback: huggyllama/llama-7b)')
     args = parser.parse_args()
 
     device = torch.device('cuda')
@@ -191,7 +204,9 @@ def main():
 
     # Dataset and DataLoader
     tokens_per_step = args.batch_size * config.context_length  # 64 * 2048 = 131,072
-    dataset = PretrainDataset(args.data, config.context_length, start_position=data_position)
+    dataset = PretrainDataset(args.data, config.context_length,
+                              start_position=data_position,
+                              tokenizer_name=args.tokenizer)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
