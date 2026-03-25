@@ -37,11 +37,26 @@ class PretrainDataset(torch.utils.data.Dataset):
                  tokenizer_name="meta-llama/Llama-3.2-1B"):
         self.seq_len = seq_len
         cache_path = jsonl_path.replace('.jsonl', '.bin')
+        meta_path = jsonl_path.replace('.jsonl', '_cache_meta.json')
 
         self._tokenizer_name = tokenizer_name
+
+        # Validate existing cache was built with the same tokenizer
+        if os.path.exists(cache_path) and os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if meta.get('tokenizer_name') != tokenizer_name:
+                print(f"Cache built with '{meta.get('tokenizer_name')}', "
+                      f"but now using '{tokenizer_name}'. Rebuilding cache.")
+                os.remove(cache_path)
+                os.remove(meta_path)
+        elif os.path.exists(cache_path) and not os.path.exists(meta_path):
+            print("Cache exists but no metadata found — rebuilding to be safe.")
+            os.remove(cache_path)
+
         if not os.path.exists(cache_path):
-            print(f"Pre-tokenizing {jsonl_path} → {cache_path} ...")
-            self._tokenize_to_bin(jsonl_path, cache_path, tokenizer_name)
+            print(f"Pre-tokenizing {jsonl_path} ...")
+            self._tokenize_to_bin(jsonl_path, cache_path, meta_path, tokenizer_name)
 
         self.data = np.memmap(cache_path, dtype=np.uint32, mode='r')
         self.total_chunks = len(self.data) // (seq_len + 1)  # +1 for target shift
@@ -50,7 +65,8 @@ class PretrainDataset(torch.utils.data.Dataset):
         print(f"Dataset: {len(self.data):,} tokens, {self.total_chunks:,} chunks, "
               f"starting at position {start_position}")
 
-    def _tokenize_to_bin(self, jsonl_path, cache_path, tokenizer_name="meta-llama/Llama-3.2-1B"):
+    def _tokenize_to_bin(self, jsonl_path, cache_path, meta_path,
+                          tokenizer_name="meta-llama/Llama-3.2-1B"):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, trust_remote_code=True
@@ -85,6 +101,17 @@ class PretrainDataset(torch.utils.data.Dataset):
 
         arr.tofile(cache_path)
         print(f"  Saved to {cache_path} ({os.path.getsize(cache_path) / 1e9:.2f} GB)")
+
+        # Write cache metadata for future validation
+        with open(meta_path, 'w') as f:
+            json.dump({
+                'tokenizer_name': tokenizer_name,
+                'vocab_size': tokenizer.vocab_size,
+                'n_tokens': total_tokens,
+                'n_documents': count,
+                'created': time.strftime('%Y-%m-%d %H:%M'),
+            }, f, indent=2)
+        print(f"  Cache metadata saved to {meta_path}")
 
     def __len__(self):
         return self.total_chunks - self.start_position
